@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Law Clerk headshot harvester (Bing only; no Selenium/WebDriver).
-
-Key fixes:
-• Hyphen/diacritic-safe name gate.
-• High-trust host checked via (purl or murl); smarter title budget usage.
-• Person folder created only after _1.jpg is secured.
-• Staged fallbacks if strict filters find too few images (relaxed name gate,
-  drop law/clerk for low-trust only as needed, and soften face/quality gates).
-• Better pHash de-dupe seeding even when _1 face crop fails.
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Silence noisy pkg_resources warning from face_recognition_models only
-# ──────────────────────────────────────────────────────────────────────────────
-
 import warnings
 warnings.filterwarnings(
     "ignore",
