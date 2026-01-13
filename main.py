@@ -1,3 +1,24 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Law Clerk headshot harvester (Bing only; no Selenium/WebDriver).
+
+Key fixes:
+• Hyphen/diacritic-safe name gate.
+• High-trust host checked via (purl or murl); smarter title budget usage.
+• Person folder created only after _1.jpg is secured.
+• Staged fallbacks if strict filters find too few images (relaxed name gate,
+  drop law/clerk for low-trust only as needed, and soften face/quality gates).
+• Better pHash de-dupe seeding even when _1 face crop fails.
+• FIXED: LinkedIn exact match now validates face presence before accepting image.
+• FIXED: Added YOLO/HOG person detection to filter out background images without people.
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Silence noisy pkg_resources warning from face_recognition_models only
+# ──────────────────────────────────────────────────────────────────────────────
+
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -39,6 +60,19 @@ try:
     _HAS_DEEPFACE = True
 except Exception:
     _HAS_DEEPFACE = False
+
+_HAS_YOLO = False
+_YOLO_MODEL = None
+try:
+    from ultralytics import YOLO
+    _HAS_YOLO = True
+    # Load YOLOv8 nano model (smallest, fastest) - will auto-download on first use
+    _YOLO_MODEL = YOLO('yolov8n.pt')
+    _YOLO_MODEL.fuse()  # Optimize for inference
+    print("[INFO] YOLOv8 loaded successfully for person detection")
+except Exception as e:
+    print(f"[INFO] YOLO not available: {e}. Falling back to HOG detection.")
+    _HAS_YOLO = False
 
 try:
     from gender_guesser import detector as gender
@@ -86,6 +120,11 @@ MAX_FACE_AREA_FRAC = 0.70
 MIN_ENTROPY_BITS = 4.0
 MIN_SKIN_FRAC = 0.02
 PHASH_HAMMING_NEAR = 8
+
+# Person detection settings
+USE_PERSON_DETECTION = True  # Set to False to disable person detection entirely
+PERSON_DETECTION_METHOD = "yolo"  # Options: "yolo" (best, auto-downloads model) or "hog" (faster, built-in)
+YOLO_CONFIDENCE_THRESHOLD = 0.25  # Lower = more lenient (accepts more images), Higher = stricter
 
 # URL tokens indicating artwork / non-photo
 ART_URL_TOKENS = [
@@ -484,6 +523,84 @@ def _phash_from_bytes(img_bytes: bytes) -> Optional[int]:
     except Exception:
         return None
 
+def contains_person_yolo(img_bytes: bytes, confidence_threshold: float = YOLO_CONFIDENCE_THRESHOLD) -> bool:
+    """
+    Check if image contains a person using YOLOv8 detector.
+    YOLOv8 is state-of-the-art and more accurate than HOG (95%+ accuracy).
+    Returns True if at least one person is detected with confidence >= threshold.
+    """
+    if not _HAS_YOLO or _YOLO_MODEL is None:
+        return False
+        
+    try:
+        # Load image
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        img_array = np.array(img)
+        
+        # Run YOLO inference (verbose=False for silent operation)
+        results = _YOLO_MODEL(img_array, verbose=False)
+        
+        # Check if any person (class 0 in COCO dataset) is detected
+        for result in results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    # Class 0 = person in COCO dataset
+                    if int(box.cls) == 0 and float(box.conf) >= confidence_threshold:
+                        return True
+        
+        return False
+        
+    except Exception:
+        # If YOLO detection fails, return False (reject image)
+        return False
+
+def contains_person_hog(img_bytes: bytes) -> bool:
+    """
+    Check if image contains a person using HOG (Histogram of Oriented Gradients) detector.
+    This is a fast, reliable fallback method when YOLO is not available.
+    Returns True if at least one person is detected.
+    """
+    try:
+        # Load image
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        img_array = np.array(img)
+        
+        # Initialize HOG person detector
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        
+        # Detect people - try multiple scales for better detection
+        (people, _) = hog.detectMultiScale(
+            img_array,
+            winStride=(8, 8),
+            padding=(16, 16),
+            scale=1.05
+        )
+        
+        # Return True if at least one person detected
+        return len(people) > 0
+        
+    except Exception:
+        # If detection fails, return False (reject image)
+        return False
+
+def contains_person(img_bytes: bytes) -> bool:
+    """
+    Unified person detection function that uses the configured method (YOLO or HOG).
+    Returns True if a person is detected, or if detection is disabled.
+    """
+    # If person detection is disabled entirely, always return True
+    if not USE_PERSON_DETECTION:
+        return True
+    
+    # Try YOLO first if enabled and available
+    if PERSON_DETECTION_METHOD.lower() == "yolo" and _HAS_YOLO:
+        return contains_person_yolo(img_bytes)
+    
+    # Fall back to HOG
+    return contains_person_hog(img_bytes)
+
 def extract_real_face(
     img_bytes: bytes,
     murl: str = "",
@@ -701,6 +818,7 @@ def salvage_original_tiles(
     """
     Last-resort: accept ORIGINAL images (not face-verified crops) using relaxed/loose name match.
     We dedupe by canonical URL and by pHash of the original frame to avoid repeats.
+    NOW WITH PERSON DETECTION: Only accepts images that contain at least one person (YOLO/HOG).
     """
     imgs_b: List[bytes] = []
     meta: List[Tuple[str, str, int]] = []
@@ -731,6 +849,10 @@ def salvage_original_tiles(
 
         # Skip obviously non-photo URLs
         if _looks_like_art_url(murl) or _looks_like_art_url(purl):
+            continue
+
+        # NEW: Check if image contains a person using YOLO/HOG detector
+        if not contains_person(b):
             continue
 
         # pHash of ORIGINAL (not crop) to avoid same frame repeats, even via different CDNs.
@@ -771,25 +893,54 @@ def pick_school_name(education: str) -> str:
     return parts[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LinkedIn-match (short-circuit) helper
+# LinkedIn-match (short-circuit) helper with FACE VALIDATION
 # ──────────────────────────────────────────────────────────────────────────────
 
 def try_linkedin_image_exact(first: str, last: str, linkedin_url: str) -> Optional[Dict]:
-    if not linkedin_url: return None
+    """
+    Try to find an exact LinkedIn profile image match.
+    CRITICAL: Now validates that the image contains both a face AND a person before accepting it.
+    """
+    if not linkedin_url: 
+        return None
+    
     query = f'"{first} {last}" linkedin'
     tiles = bing_images_tiles_across_pages(query, want=30, max_pages=2)
     want_norm = normalize_linkedin_url(linkedin_url)
-    best = None; best_sim = 0.0
+    best = None
+    best_sim = 0.0
+    
     for t in tiles:
         purl = t.get("purl") or ""
-        if "linkedin.com" not in purl and "licdn.com" not in purl: continue
+        if "linkedin.com" not in purl and "licdn.com" not in purl: 
+            continue
         sim = linkedin_similarity(purl, want_norm)
-        if sim > best_sim: best_sim = sim; best = t
-        if sim >= 0.99: break
+        if sim > best_sim: 
+            best_sim = sim
+            best = t
+        if sim >= 0.99: 
+            break
+    
     if best and best_sim >= 0.6:
         b = download_tile_image(best)
         if b:
-            return {"img_bytes": b, "murl": best.get("murl",""), "purl": best.get("purl",""), "search_query": query}
+            murl = best.get("murl", "")
+            purl = best.get("purl", "")
+            
+            # CRITICAL FIX 1: Validate that image contains a person (YOLO/HOG detection)
+            if not contains_person(b):
+                return None
+            
+            # CRITICAL FIX 2: Validate that the image contains a face
+            face = extract_real_face(b, murl=murl, purl=purl)
+            if face:  # Only return if we can extract a valid face
+                return {
+                    "img_bytes": b, 
+                    "murl": murl, 
+                    "purl": purl, 
+                    "search_query": query
+                }
+    
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -870,7 +1021,7 @@ def process_person(first: str, middle: str, last: str, suffix: str,
                    out_root: str, full_name: str) -> Tuple[List[Dict], Dict]:
     """
     Main per-person pipeline:
-    - Try LinkedIn short-circuit (exact match → 1 image).
+    - Try LinkedIn short-circuit (exact match → 1 image) WITH FACE VALIDATION.
     - Otherwise build a 7-image bundle:
         1) _1.jpg = best LinkedIn/name-validated ORIGINAL tile.
         2) _2.. = face crops from "<First Last>" "Law Clerk" with staged fallbacks.
@@ -884,7 +1035,7 @@ def process_person(first: str, middle: str, last: str, suffix: str,
     # Reset limited title-fetch budget
     reset_title_budget()
 
-    # A) Try strict LinkedIn match short-circuit
+    # A) Try strict LinkedIn match short-circuit (NOW WITH FACE VALIDATION)
     if linkedin_url:
         try:
             li_hit = try_linkedin_image_exact(first, last, linkedin_url)
